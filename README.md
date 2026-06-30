@@ -77,7 +77,7 @@ EmotionalAI/
 
 ## 2.1 安裝 Python
 
-請先安裝 Python。
+請先安裝 Python3.12.10版本。
 
 ### Windows
 
