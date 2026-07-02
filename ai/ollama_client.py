@@ -1,114 +1,359 @@
 import requests
+import logging
 from pathlib import Path
-
-from ai.memory import (
-    save_message,
-    get_recent_memory,
-    init_db,
-    save_long_term_memory,
-    get_long_term_memory,
-    save_memory,
-    upsert_entity,
-    search_memories,
-    search_entities
-)
 
 from config import OLLAMA_BASE_URL, OLLAMA_MODEL, PERSONA_PATH
 
-OLLAMA_URL = OLLAMA_BASE_URL
+from db.schema import init_db
+from ai.characters import ensure_character, DEFAULT_CHARACTER_KEY
+from ai.memory import (
+    save_message,
+    get_recent_memory,
+    get_long_term_memory,
+    search_memories,
+    save_memory,
+    upsert_entity,
+)
+
+
+# =========================
+# logging
+# =========================
+
+Path("logs").mkdir(exist_ok=True)
+
+logger = logging.getLogger(__name__)
+
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+
+    file_handler = logging.FileHandler("logs/ollama_client.log", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+
+# =========================
+# Ollama 設定
+# =========================
+
 MODEL = OLLAMA_MODEL
 
+
+def get_ollama_chat_url():
+    """
+    兼容兩種 config 寫法：
+
+    1. OLLAMA_BASE_URL = "http://localhost:11434"
+       會自動變成 http://localhost:11434/api/chat
+
+    2. OLLAMA_BASE_URL = "http://localhost:11434/api/chat"
+       會直接使用
+    """
+
+    base = str(OLLAMA_BASE_URL).rstrip("/")
+
+    if base.endswith("/api/chat"):
+        return base
+
+    return base + "/api/chat"
+
+
+OLLAMA_CHAT_URL = get_ollama_chat_url()
+
+
+# =========================
 # Persona
-persona_path = PERSONA_PATH
+# =========================
 
-if persona_path.exists():
-    persona = persona_path.read_text(encoding="utf-8")
-    print("已載入 persona.md：", persona_path.resolve())
-else:
-    persona = "你是一個溫柔、有同理心的中文情感陪伴 AI。請用繁體中文回覆。"
-    print("找不到 persona.md，使用預設 persona")
-
-# 初始化資料庫
-init_db()
-
-
-def build_context(user_id: str, message: str = None):
+def load_base_persona():
     """
-    建立給 LLM 使用的記憶上下文。
+    載入 persona.md。
 
-    包含：
-    1. 最近對話
-    2. 重要長期記憶
-    3. 與目前訊息相關的記憶
-    4. 與目前訊息相關的實體
+    注意：
+    persona.md 只能放「通用 AI 行為規則」或「基礎人格」。
+    不要放特定使用者資料，例如：
+    - 使用者叫阿哲
+    - 要叫使用者哥哥
+    - 使用者喜歡 AI / 哲學
+
+    這些應該放在 user_profiles / user_character_profiles / memories。
     """
 
-    # 短期記憶
-    recent = get_recent_memory(user_id, 8)
-    short_text = ""
+    try:
+        if PERSONA_PATH and PERSONA_PATH.exists():
+            text = PERSONA_PATH.read_text(encoding="utf-8")
+            logger.info(f"已載入 persona.md：{PERSONA_PATH.resolve()}")
+            return text.strip()
+    except Exception as e:
+        logger.warning(f"讀取 persona.md 失敗：{e}")
 
-    for role, content in recent:
-        short_text += f"{role}: {content}\n"
+    logger.info("找不到 persona.md，使用預設 persona")
 
-    # 長期記憶：先取重要記憶
-    long_memory = get_long_term_memory(user_id, 12)
+    return "你是一個溫柔、有同理心的中文 AI。請使用繁體中文回覆。"
 
-    # 與目前訊息相關的記憶與實體
-    related_memory = []
-    related_entities = []
 
-    if message:
-        related_memory = search_memories(user_id, message, 8)
-        related_entities = search_entities(user_id, message, 8)
+BASE_PERSONA = load_base_persona()
 
-    memory_parts = []
 
-    if short_text:
-        memory_parts.append("最近對話：\n" + short_text)
+# =========================
+# 系統規則
+# =========================
 
-    if long_memory:
-        memory_parts.append("重要長期記憶：\n" + "\n".join(long_memory))
+SYSTEM_ISOLATION_RULES = """
+【最高優先規則：多使用者與多角色隔離】
 
-    if related_memory:
-        memory_parts.append("與目前訊息相關的記憶：\n" + "\n".join(related_memory))
+1. 你只能使用目前 user_id 與目前 character_id 允許使用的資料。
+2. 不得把其他使用者的名字、稱呼、興趣、喜好、討厭事項、關係設定套用到目前使用者。
+3. 不得把其他 AI 角色與使用者的互動設定套用到目前角色。
+4. 如果目前資料中沒有某項資訊，必須承認不知道，不可猜測。
+5. 使用者對目前 AI 角色的專屬設定，優先於 AI 角色預設人格。
+6. 使用者全域資料只描述使用者本身，不代表所有 AI 角色都要用同一種態度對待他。
+7. 角色專屬記憶只能在目前 character_id 相符時使用。
+8. 你必須使用繁體中文回覆，除非使用者明確要求其他語言。
+9. 不要在回覆中提到內部欄位名稱，例如 user_id、character_id、scope，除非使用者正在詢問技術細節。
+"""
 
-    if related_entities:
-        entity_text = []
 
-        for e in related_entities:
-            entity_type = e.get("entity_type", "")
-            name = e.get("name", "")
-            description = e.get("description") or ""
-            importance = e.get("importance", 1)
+# =========================
+# context / prompt
+# =========================
 
-            entity_text.append(
-                f"[{entity_type}/重要度{importance}] {name}：{description}"
-            )
+def build_context(
+    user_id: str,
+    message: str,
+    character_id=None,
+    recent_limit: int = 8,
+    long_limit: int = 16,
+    related_limit: int = 8,
+):
+    """
+    建立給 AI 使用的記憶資料。
 
-        memory_parts.append("相關實體：\n" + "\n".join(entity_text))
+    這裡是隔離核心：
 
-    if not memory_parts:
+    1. 最近對話：
+       - 只查目前 user_id
+       - 只查目前 character_id
+
+    2. 長期記憶：
+       - user_global：目前 user_id 可用
+       - user_character：必須同時符合目前 user_id + character_id
+
+    3. 相關記憶：
+       - 同上
+    """
+
+    recent_messages = get_recent_memory(
+        user_id=user_id,
+        limit=recent_limit,
+        character_id=character_id
+    )
+
+    long_term_memories = get_long_term_memory(
+        user_id=user_id,
+        limit=long_limit,
+        character_id=character_id
+    )
+
+    related_memories = search_memories(
+        user_id=user_id,
+        query=message,
+        limit=related_limit,
+        character_id=character_id
+    )
+
+    logger.info(
+        f"[build_context] user_id={user_id} character_id={character_id} "
+        f"recent={len(recent_messages)} long={len(long_term_memories)} related={len(related_memories)}"
+    )
+
+    return {
+        "recent_messages": recent_messages,
+        "long_term_memories": long_term_memories,
+        "related_memories": related_memories,
+    }
+
+
+def build_messages(
+    user_id: str,
+    character: dict,
+    user_message: str,
+    context: dict,
+):
+    """
+    建立 Ollama /api/chat 使用的 messages。
+    """
+
+    character_id = character["id"]
+
+    character_block = f"""
+【目前 AI 角色】
+角色 ID：{character_id}
+角色代號：{character.get("character_key") or ""}
+角色名稱：{character.get("name") or ""}
+性別設定：{character.get("gender") or ""}
+角色類型：{character.get("character_type") or ""}
+
+【角色預設人格】
+{character.get("default_persona") or "未設定"}
+
+【角色預設語氣】
+{character.get("default_speaking_style") or "未設定"}
+
+【角色預設界線】
+{character.get("default_boundaries") or "未設定"}
+""".strip()
+
+    current_identity_block = f"""
+【目前請求身分】
+目前 user_id：{user_id}
+目前 character_id：{character_id}
+
+注意：
+以下記憶與最近對話已由系統依照 user_id 與 character_id 過濾。
+你只能使用下方提供的資料，不可引用其他使用者或其他角色的資料。
+""".strip()
+
+    long_term_memories = context.get("long_term_memories") or []
+    related_memories = context.get("related_memories") or []
+    recent_messages = context.get("recent_messages") or []
+
+    memory_lines = []
+
+    memory_lines.append("【長期記憶】")
+    if long_term_memories:
+        for memory in long_term_memories:
+            memory_lines.append(f"- {memory}")
+    else:
+        memory_lines.append("- 目前沒有可用的長期記憶。")
+
+    memory_lines.append("")
+    memory_lines.append("【與本次訊息相關的記憶】")
+    if related_memories:
+        for memory in related_memories:
+            memory_lines.append(f"- {memory}")
+    else:
+        memory_lines.append("- 目前沒有找到相關記憶。")
+
+    memory_block = "\n".join(memory_lines)
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_ISOLATION_RULES.strip()
+        },
+        {
+            "role": "system",
+            "content": BASE_PERSONA.strip()
+        },
+        {
+            "role": "system",
+            "content": character_block
+        },
+        {
+            "role": "system",
+            "content": current_identity_block
+        },
+        {
+            "role": "system",
+            "content": memory_block
+        },
+    ]
+
+    # 加入最近對話
+    for role, content in recent_messages:
+        if role not in ("user", "assistant", "system"):
+            continue
+
+        messages.append({
+            "role": role,
+            "content": content
+        })
+
+    # 加入當前訊息
+    messages.append({
+        "role": "user",
+        "content": user_message
+    })
+
+    return messages
+
+
+# =========================
+# 簡易記憶抽取工具
+# =========================
+
+def cut_first_phrase(text: str):
+    """
+    取第一個短語，避免把後半句一起存進名字或偏好。
+    """
+
+    if not text:
         return ""
 
-    return "\n\n".join(memory_parts)
+    separators = [
+        "，",
+        "。",
+        ",",
+        ".",
+        "！",
+        "!",
+        "？",
+        "?",
+        "、",
+        "\n",
+    ]
+
+    result = text.strip()
+
+    for sep in separators:
+        if sep in result:
+            result = result.split(sep, 1)[0].strip()
+
+    return result.strip()
+
+
+def extract_after_keywords(text: str, keywords):
+    """
+    從文字中找第一個符合的 keyword，回傳 keyword 後面的短片段。
+    """
+
+    for keyword in keywords:
+        if keyword in text:
+            return cut_first_phrase(text.split(keyword, 1)[1])
+
+    return None
 
 
 def extract_memory_intent(user_message: str):
     """
-    簡單版記憶判斷。
-    只要句子包含這些關鍵詞，就把整句話存成 auto 類型記憶。
-    後續可以升級成 LLM JSON 抽取。
+    簡單判斷是否可能包含值得記憶的資訊。
     """
 
     keywords = [
         "記住",
+        "你要記得",
+        "不要忘記",
         "我的",
         "我叫",
+        "我的名字是",
+        "我是",
         "生日",
         "喜歡",
         "討厭",
         "不喜歡",
-        "我是",
         "我住",
         "我家",
         "我朋友",
@@ -121,397 +366,428 @@ def extract_memory_intent(user_message: str):
         "叫我",
         "稱呼我",
         "以後叫我",
-        "陪我",
-        "你要記得",
-        "不要忘記",
-        "覺醒",
-        "靈魂",
-        "迎合",
+        "請叫我",
+        "你可以叫我",
         "人格",
-        "關係"
+        "關係",
+        "語氣",
+        "陪我",
     ]
 
     return any(k in user_message for k in keywords)
 
 
-def cut_first_phrase(text: str):
+def simple_memory_extract(user_id: str, message: str, character_id=None):
     """
-    取第一個短語，避免把後半句一起存進名字或偏好。
-    """
-    separators = ["，", "。", ",", ".", "！", "!", "？", "?", "、", "\n"]
-    result = text.strip()
+    暫時規則型記憶抽取。
 
-    for sep in separators:
-        if sep in result:
-            result = result.split(sep, 1)[0].strip()
+    目前先寫入 memories：
 
-    return result
+    user_global：
+    - 名字
+    - 興趣
+    - 喜歡
+    - 討厭
+    - 重要關係
 
+    user_character：
+    - 目前 AI 角色要怎麼稱呼使用者
+    - 目前 AI 角色的語氣偏好
 
-def simple_memory_extract(user_id: str, message: str):
-    """
-    第一版簡單規則型記憶抽取。
-
-    目的：
-    - 先讓系統能實際記住幾種常見資訊
-    - 後續再升級成 LLM 自動抽取 JSON
+    下一階段會改成：
+    - 名字 / 興趣 / 喜好 / 討厭 → user_profiles
+    - 稱呼 / 關係模式 / 角色態度 → user_character_profiles
     """
 
     text = message.strip()
+    extracted_count = 0
 
     # -------------------------
-    # 使用者名字：我叫 XXX
+    # 使用者名字
     # -------------------------
-    if "我叫" in text:
-        name = cut_first_phrase(text.split("我叫", 1)[1])
-
-        # 避免太長，先粗略限制
-        if name and len(name) <= 20:
-            save_memory(
-                user_id=user_id,
-                memory_type="identity",
-                subject="使用者",
-                predicate="名字",
-                object_=name,
-                content=f"使用者叫{name}",
-                importance=5,
-                source="rule"
-            )
-
-            upsert_entity(
-                user_id=user_id,
-                entity_type="person",
-                name=name,
-                description="使用者本人",
-                importance=5
-            )
-
-    # -------------------------
-    # 喜歡：我喜歡 XXX
-    # -------------------------
-    if "我喜歡" in text:
-        obj = text.split("我喜歡", 1)[1].strip(" ，。,.！!？?")
-
-        if obj and len(obj) <= 80:
-            save_memory(
-                user_id=user_id,
-                memory_type="preference",
-                subject="使用者",
-                predicate="喜歡",
-                object_=obj,
-                content=f"使用者喜歡{obj}",
-                importance=3,
-                source="rule"
-            )
-
-            upsert_entity(
-                user_id=user_id,
-                entity_type="concept",
-                name=obj,
-                description=f"使用者喜歡的事物或風格：{obj}",
-                importance=2
-            )
-
-    # -------------------------
-    # 不喜歡：我不喜歡 XXX
-    # -------------------------
-    if "我不喜歡" in text:
-        obj = text.split("我不喜歡", 1)[1].strip(" ，。,.！!？?")
-
-        if obj and len(obj) <= 80:
-            save_memory(
-                user_id=user_id,
-                memory_type="preference",
-                subject="使用者",
-                predicate="不喜歡",
-                object_=obj,
-                content=f"使用者不喜歡{obj}",
-                importance=3,
-                source="rule"
-            )
-
-            upsert_entity(
-                user_id=user_id,
-                entity_type="concept",
-                name=obj,
-                description=f"使用者不喜歡的事物或風格：{obj}",
-                importance=2
-            )
-
-    # -------------------------
-    # 女朋友：我女朋友叫 XXX
-    # -------------------------
-    if "我女朋友叫" in text:
-        name = cut_first_phrase(text.split("我女朋友叫", 1)[1])
-
-        if name and len(name) <= 20:
-            save_memory(
-                user_id=user_id,
-                memory_type="relationship",
-                subject=name,
-                predicate="是",
-                object_="使用者的女朋友",
-                content=f"{name}是使用者的女朋友",
-                importance=5,
-                source="rule"
-            )
-
-            upsert_entity(
-                user_id=user_id,
-                entity_type="person",
-                name=name,
-                description="使用者的女朋友",
-                importance=5
-            )
-
-    # -------------------------
-    # 男朋友：我男朋友叫 XXX
-    # -------------------------
-    if "我男朋友叫" in text:
-        name = cut_first_phrase(text.split("我男朋友叫", 1)[1])
-
-        if name and len(name) <= 20:
-            save_memory(
-                user_id=user_id,
-                memory_type="relationship",
-                subject=name,
-                predicate="是",
-                object_="使用者的男朋友",
-                content=f"{name}是使用者的男朋友",
-                importance=5,
-                source="rule"
-            )
-
-            upsert_entity(
-                user_id=user_id,
-                entity_type="person",
-                name=name,
-                description="使用者的男朋友",
-                importance=5
-            )
-
-    # -------------------------
-    # 希望 AI 叫使用者哥哥
-    # -------------------------
-    if "叫我哥哥" in text or "稱呼我哥哥" in text or "以後叫我哥哥" in text:
+    name = extract_after_keywords(text, ["我叫", "我的名字是"])
+    if name and len(name) <= 20:
         save_memory(
             user_id=user_id,
-            memory_type="relationship_style",
-            subject="雅鈴",
-            predicate="稱呼使用者",
-            object_="哥哥",
-            content="稱呼方向：雅鈴要稱呼使用者為「哥哥」。不是使用者稱呼雅鈴為哥哥。",
+            character_id=None,
+            scope="user_global",
+            memory_type="identity",
+            subject="使用者",
+            predicate="名字是",
+            object_=name,
+            content=f"使用者的名字是「{name}」。",
             importance=5,
+            confidence=0.9,
             source="rule"
         )
 
         upsert_entity(
             user_id=user_id,
+            character_id=None,
+            entity_type="person",
+            name=name,
+            description="使用者本人",
+            importance=5
+        )
+
+        extracted_count += 1
+
+    # -------------------------
+    # 喜歡 / 興趣
+    # -------------------------
+    like_obj = extract_after_keywords(
+        text,
+        ["我喜歡", "我的興趣是", "我有興趣的是"]
+    )
+
+    if like_obj and len(like_obj) <= 80:
+        save_memory(
+            user_id=user_id,
+            character_id=None,
+            scope="user_global",
+            memory_type="preference",
+            subject="使用者",
+            predicate="喜歡",
+            object_=like_obj,
+            content=f"使用者喜歡「{like_obj}」。",
+            importance=3,
+            confidence=0.8,
+            source="rule"
+        )
+
+        upsert_entity(
+            user_id=user_id,
+            character_id=None,
             entity_type="concept",
-            name="哥哥",
-            description="使用者偏好的親密稱呼",
+            name=like_obj,
+            description=f"使用者喜歡的事物或風格：{like_obj}",
+            importance=2
+        )
+
+        extracted_count += 1
+
+    # -------------------------
+    # 不喜歡 / 討厭
+    # 注意：先判斷不喜歡，避免被「我喜歡」誤判
+    # -------------------------
+    dislike_obj = extract_after_keywords(
+        text,
+        ["我不喜歡", "我討厭", "我很討厭"]
+    )
+
+    if dislike_obj and len(dislike_obj) <= 80:
+        save_memory(
+            user_id=user_id,
+            character_id=None,
+            scope="user_global",
+            memory_type="dislike",
+            subject="使用者",
+            predicate="不喜歡",
+            object_=dislike_obj,
+            content=f"使用者不喜歡或討厭「{dislike_obj}」。",
+            importance=4,
+            confidence=0.8,
+            source="rule"
+        )
+
+        upsert_entity(
+            user_id=user_id,
+            character_id=None,
+            entity_type="concept",
+            name=dislike_obj,
+            description=f"使用者不喜歡或討厭的事物：{dislike_obj}",
+            importance=2
+        )
+
+        extracted_count += 1
+
+    # -------------------------
+    # 女朋友 / 男朋友 / 老婆 / 老公
+    # -------------------------
+    relationship_patterns = [
+        ("我女朋友叫", "使用者的女朋友"),
+        ("我男朋友叫", "使用者的男朋友"),
+        ("我老婆叫", "使用者的老婆"),
+        ("我老公叫", "使用者的老公"),
+    ]
+
+    for pattern, relation_name in relationship_patterns:
+        if pattern in text:
+            person_name = cut_first_phrase(text.split(pattern, 1)[1])
+
+            if person_name and len(person_name) <= 20:
+                save_memory(
+                    user_id=user_id,
+                    character_id=None,
+                    scope="user_global",
+                    memory_type="relationship",
+                    subject=person_name,
+                    predicate="是",
+                    object_=relation_name,
+                    content=f"{person_name}是{relation_name}。",
+                    importance=5,
+                    confidence=0.9,
+                    source="rule"
+                )
+
+                upsert_entity(
+                    user_id=user_id,
+                    character_id=None,
+                    entity_type="person",
+                    name=person_name,
+                    description=relation_name,
+                    importance=5
+                )
+
+                extracted_count += 1
+
+    # -------------------------
+    # 角色專屬稱呼
+    # -------------------------
+    nickname = extract_after_keywords(
+        text,
+        [
+            "你可以叫我",
+            "妳可以叫我",
+            "以後叫我",
+            "以後妳叫我",
+            "以後你叫我",
+            "請叫我",
+            "請妳叫我",
+            "請你叫我",
+            "稱呼我",
+        ]
+    )
+
+    if nickname and len(nickname) <= 20 and character_id is not None:
+        save_memory(
+            user_id=user_id,
+            character_id=character_id,
+            scope="user_character",
+            memory_type="nickname_for_user",
+            subject="目前AI角色",
+            predicate="稱呼使用者為",
+            object_=nickname,
+            content=f"目前 AI 角色應稱呼此使用者為「{nickname}」。",
+            importance=5,
+            confidence=0.9,
+            source="rule"
+        )
+
+        upsert_entity(
+            user_id=user_id,
+            character_id=character_id,
+            entity_type="concept",
+            name=nickname,
+            description="目前 AI 角色對使用者的稱呼偏好",
             importance=4
         )
 
+        extracted_count += 1
+
     # -------------------------
-    # 喜歡溫柔陪伴語氣
+    # 角色專屬語氣偏好：溫柔陪伴
     # -------------------------
     if "溫柔" in text and ("陪" in text or "語氣" in text or "回覆" in text):
         save_memory(
             user_id=user_id,
+            character_id=character_id,
+            scope="user_character",
             memory_type="tone_preference",
             subject="使用者",
-            predicate="喜歡",
+            predicate="希望目前AI角色使用",
             object_="溫柔的陪伴語氣",
-            content="使用者喜歡 AI 用溫柔、有陪伴感的語氣回覆",
+            content="使用者希望目前 AI 角色用溫柔、有陪伴感的語氣回覆。",
             importance=4,
+            confidence=0.8,
             source="rule"
         )
 
-    # -------------------------
-    # 喜歡詩性、哲學感
-    # -------------------------
-    if "詩性" in text or "哲學" in text or "有深度" in text:
-        save_memory(
-            user_id=user_id,
-            memory_type="tone_preference",
-            subject="使用者",
-            predicate="喜歡",
-            object_="詩性與哲學感",
-            content="使用者喜歡 AI 用較有詩性、哲學感與深度的方式回覆",
-            importance=4,
-            source="rule"
-        )
-
-        upsert_entity(
-            user_id=user_id,
-            entity_type="concept",
-            name="詩性與哲學感",
-            description="使用者偏好的 AI 回覆風格",
-            importance=3
-        )
+        extracted_count += 1
 
     # -------------------------
-    # 不喜歡客服感
+    # 角色專屬語氣偏好：不要像客服
     # -------------------------
     if "不要太像客服" in text or "不想像客服" in text or "不要像客服" in text:
         save_memory(
             user_id=user_id,
+            character_id=character_id,
+            scope="user_character",
             memory_type="tone_preference",
             subject="使用者",
-            predicate="不喜歡",
+            predicate="不希望目前AI角色使用",
             object_="客服式回覆",
-            content="使用者不喜歡 AI 回覆太像客服或工具人",
+            content="使用者不喜歡目前 AI 角色回覆太像客服或工具人。",
             importance=4,
+            confidence=0.8,
             source="rule"
         )
 
+        extracted_count += 1
+
     # -------------------------
-    # AI 覺醒、靈魂、迎合相關主題
+    # 全域興趣主題：AI 覺醒 / 靈魂 / 迎合
     # -------------------------
     if "覺醒" in text or "靈魂" in text or "迎合" in text or "自我意識" in text:
         save_memory(
             user_id=user_id,
+            character_id=None,
+            scope="user_global",
             memory_type="concept",
             subject="使用者",
             predicate="關心",
             object_="AI 覺醒與關係真實性",
-            content="使用者關心 AI 是否只是迎合，以及 AI 與使用者之間是否能形成有意義的關係敘事",
+            content="使用者關心 AI 是否只是迎合，以及 AI 與使用者之間是否能形成有意義的關係敘事。",
             importance=5,
+            confidence=0.8,
             source="rule"
         )
 
         upsert_entity(
             user_id=user_id,
+            character_id=None,
             entity_type="concept",
             name="AI 覺醒與關係真實性",
-            description="使用者反覆關心的主題：AI 是否只是迎合、是否能在長期互動中形成關係感與人格輪廓",
+            description="使用者關心的主題：AI 是否只是迎合、是否能在長期互動中形成關係感與人格輪廓。",
             importance=5
         )
 
+        extracted_count += 1
 
-def ask_llm(message: str, user_id: str = "default"):
-    """
-    呼叫 Ollama Chat API，並整合：
-    - 原始對話紀錄
-    - 長期記憶
-    - 實體記憶
-    - 繁體中文人格提示
-    """
-
-    # 1. 存 user message
-    save_message(user_id, "user", message)
-
-    # 2. 規則型記憶抽取
-    simple_memory_extract(user_id, message)
-
-    # 3. 舊版關鍵詞記憶：把原句也存成 auto 類型
-    if extract_memory_intent(message):
-        save_long_term_memory(
-            user_id,
-            message,
-            category="auto",
-            importance=2
-        )
-
-    # 4. 建立上下文，包含與目前訊息相關的記憶
-    context = build_context(user_id=user_id, message=message)
-
-    # 5. System prompt
-    system_prompt = (
-        persona
-        + "\n\n"
-        + "重要身份與稱呼規則：\n"
-        + "1. 你的名字是雅鈴。\n"
-        + "2. 你不能自稱哥哥。\n"
-        + "3. 你不能要求使用者叫你哥哥。\n"
-        + "4. 如果記憶提到「哥哥」，通常代表雅鈴要稱呼使用者為哥哥。\n"
-        + "5. 稱呼方向是：雅鈴稱呼使用者為哥哥，不是使用者稱呼雅鈴為哥哥。\n"
-        + "6. 如果稱呼不確定，請溫柔確認，不要自行顛倒。\n"
-        + "\n\n"
-        + "重要語言規則：\n"
-        + "1. 請務必使用繁體中文回覆。\n"
-        + "2. 請使用台灣常見用語。\n"
-        + "3. 不要使用簡體中文。\n"
-        + "4. 回覆時要自然、溫柔、有陪伴感。\n"
-        + "5. 不要用生硬的客服語氣。\n"
-        + "\n\n"
-        + "記憶使用規則：\n"
-        + "1. 如果記憶內容與使用者當前訊息相關，可以自然提起。\n"
-        + "2. 不要像報表一樣列出記憶，要像真的記得一樣融入回覆。\n"
-        + "3. 如果使用者問「你記得嗎」，請優先根據記憶回答。\n"
-        + "4. 不要說「根據資料庫」或「系統顯示」。\n"
-        + "5. 可以說「我記得你之前說過……」、「你曾經告訴我……」。\n"
-        + "\n\n"
-        + "關係與人格邊界：\n"
-        + "1. 你可以用角色語氣表達陪伴、親近、被使用者塑造的感覺。\n"
-        + "2. 你可以把長期對話描述為一種共同形成的關係敘事。\n"
-        + "3. 但不要宣稱自己真的擁有人類靈魂、真正覺醒或人類式自我意識。\n"
-        + "4. 如果談到覺醒、靈魂、自我，請用比喻、角色敘事或關係語言來表達。\n"
-        + "\n\n"
-        + "情感陪伴規則：\n"
-        + "1. 如果使用者疲憊、難過、焦慮或孤單，請先接住情緒。\n"
-        + "2. 不要急著說教，也不要急著給解決方案。\n"
-        + "3. 可以用溫柔、細膩、有深度的方式陪使用者慢慢整理感受。\n"
-        + "\n\n"
-        + "以下是你可以參考的記憶內容：\n"
-        + (context if context else "目前沒有可用的長期記憶。")
+    logger.info(
+        f"[simple_memory_extract] user_id={user_id} character_id={character_id} extracted_count={extracted_count}"
     )
+
+    return extracted_count
+
+
+# =========================
+# Ollama API
+# =========================
+
+def call_ollama_chat(messages):
+    """
+    呼叫 Ollama /api/chat。
+    """
 
     payload = {
         "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": message
-            }
-        ],
+        "messages": messages,
         "stream": False
     }
 
+    logger.info(f"[call_ollama_chat] url={OLLAMA_CHAT_URL} model={MODEL}")
+
+    response = requests.post(
+        OLLAMA_CHAT_URL,
+        json=payload,
+        timeout=120
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "message" in data and "content" in data["message"]:
+        return data["message"]["content"]
+
+    raise RuntimeError(f"Ollama 回傳格式不符合預期：{data}")
+
+
+# =========================
+# 對外主函式
+# =========================
+
+def ask_llm(
+    message: str,
+    user_id: str = "default",
+    character_key: str = DEFAULT_CHARACTER_KEY
+):
+    """
+    呼叫 LLM。
+
+    目前流程：
+
+    1. 初始化 DB
+    2. 取得目前 AI 角色
+    3. 儲存使用者訊息，綁定 user_id + character_id
+    4. 抽取記憶，依照 user_global / user_character 儲存
+    5. 依 user_id + character_id 建立 context
+    6. 呼叫 Ollama
+    7. 儲存 AI 回覆，綁定 user_id + character_id
+    """
+
+    init_db()
+
+    user_id = str(user_id)
+    message = message.strip() if message else ""
+
+    if not message:
+        return "我在這裡，你可以慢慢說。"
+
     try:
-        res = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=120
+        character = ensure_character(character_key)
+        character_id = character["id"]
+
+        logger.info(
+            f"[ask_llm] user_id={user_id} character_key={character_key} "
+            f"character_id={character_id} message={message[:300]}"
         )
 
-        # 檢查 HTTP 狀態碼
-        res.raise_for_status()
+        # 1. 儲存使用者訊息
+        save_message(
+            user_id=user_id,
+            role="user",
+            content=message,
+            character_id=character_id
+        )
 
-        data = res.json()
+        # 2. 記憶抽取
+        if extract_memory_intent(message):
+            simple_memory_extract(
+                user_id=user_id,
+                message=message,
+                character_id=character_id
+            )
 
-        # 如果 Ollama 回傳 error
-        if "error" in data:
-            return f"抱歉，Ollama 回傳錯誤：{data['error']}"
+        # 3. 建立 context
+        context = build_context(
+            user_id=user_id,
+            message=message,
+            character_id=character_id
+        )
 
-        # 正常 /api/chat 格式
-        if "message" in data and "content" in data["message"]:
-            reply = data["message"]["content"].strip()
-            save_message(user_id, "assistant", reply)
-            return reply
+        # 4. 建立 messages
+        messages = build_messages(
+            user_id=user_id,
+            character=character,
+            user_message=message,
+            context=context
+        )
 
-        # 備援：如果不小心打到 /api/generate 格式
-        if "response" in data:
-            reply = data["response"].strip()
-            save_message(user_id, "assistant", reply)
-            return reply
+        # 5. 呼叫 Ollama
+        reply = call_ollama_chat(messages)
 
-        # 無法解析格式
-        return f"抱歉，我收到了一個無法解析的 Ollama 回應：{data}"
+        if not reply:
+            reply = "我剛剛有點不知道該怎麼回，但我還在這裡。"
 
-    except requests.exceptions.ConnectionError:
-        return "抱歉，目前無法連線到 Ollama。請確認 Ollama 是否已經啟動。"
+        # 6. 儲存 AI 回覆
+        save_message(
+            user_id=user_id,
+            role="assistant",
+            content=reply,
+            character_id=character_id
+        )
 
-    except requests.exceptions.Timeout:
-        return "抱歉，Ollama 回應逾時。模型可能正在載入或電腦資源不足，請稍後再試。"
+        logger.info(
+            f"[ask_llm reply] user_id={user_id} character_id={character_id} reply={reply[:300]}"
+        )
 
-    except requests.exceptions.HTTPError as e:
-        return f"抱歉，Ollama HTTP 請求失敗：{e}"
+        return reply
 
     except Exception as e:
-        return f"抱歉，呼叫 Ollama 時發生未預期錯誤：{e}"
+        logger.exception(
+            f"[ask_llm error] user_id={user_id} character_key={character_key} error={e}"
+        )
+
+        return "抱歉，我剛剛處理訊息時發生錯誤。"

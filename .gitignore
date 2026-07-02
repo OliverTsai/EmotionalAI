@@ -33,6 +33,7 @@ logs/
 # Database
 # =========================
 database/*.db
+database/*.db*
 database/*.sqlite
 database/*.sqlite3
 

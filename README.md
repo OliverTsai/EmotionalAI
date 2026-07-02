@@ -647,6 +647,12 @@ python test.py
 - Bot Token 是否存在
 
 
+資料庫初始化指令
+
+```bash
+python -m db.schema 
+```
+
 ---
 
 # 19. 記憶系統說明
