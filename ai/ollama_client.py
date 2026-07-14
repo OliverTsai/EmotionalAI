@@ -15,6 +15,17 @@ from ai.memory import (
     upsert_entity,
 )
 
+from ai.profiles import (
+    ensure_user_profile,
+    get_user_profile,
+    update_user_profile,
+    ensure_user_character_profile,
+    get_user_character_profile,
+    update_user_character_profile,
+    format_user_profile_for_prompt,
+    format_user_character_profile_for_prompt,
+)
+
 
 # =========================
 # logging
@@ -141,19 +152,35 @@ def build_context(
     """
     建立給 AI 使用的記憶資料。
 
-    這裡是隔離核心：
-
-    1. 最近對話：
+    隔離核心：
+    1. user_profile：
        - 只查目前 user_id
-       - 只查目前 character_id
 
-    2. 長期記憶：
+    2. user_character_profile：
+       - 只查目前 user_id + character_id
+
+    3. 最近對話：
+       - 只查目前 user_id + character_id
+
+    4. 長期記憶：
        - user_global：目前 user_id 可用
        - user_character：必須同時符合目前 user_id + character_id
 
-    3. 相關記憶：
+    5. 相關記憶：
        - 同上
     """
+
+    # 確保 profile 資料列存在
+    ensure_user_profile(user_id)
+
+    if character_id is not None:
+        ensure_user_character_profile(user_id, character_id)
+
+    user_profile = get_user_profile(user_id)
+
+    user_character_profile = None
+    if character_id is not None:
+        user_character_profile = get_user_character_profile(user_id, character_id)
 
     recent_messages = get_recent_memory(
         user_id=user_id,
@@ -176,14 +203,19 @@ def build_context(
 
     logger.info(
         f"[build_context] user_id={user_id} character_id={character_id} "
+        f"profile={'yes' if user_profile else 'no'} "
+        f"user_character_profile={'yes' if user_character_profile else 'no'} "
         f"recent={len(recent_messages)} long={len(long_term_memories)} related={len(related_memories)}"
     )
 
     return {
+        "user_profile": user_profile,
+        "user_character_profile": user_character_profile,
         "recent_messages": recent_messages,
         "long_term_memories": long_term_memories,
         "related_memories": related_memories,
     }
+
 
 
 def build_messages(
@@ -226,6 +258,25 @@ def build_messages(
 你只能使用下方提供的資料，不可引用其他使用者或其他角色的資料。
 """.strip()
 
+    user_profile = context.get("user_profile")
+    user_character_profile = context.get("user_character_profile")
+
+    user_profile_text = format_user_profile_for_prompt(user_profile)
+    user_character_profile_text = format_user_character_profile_for_prompt(user_character_profile)
+
+    profile_block = f"""
+【使用者基本資料】
+{user_profile_text}
+
+【此使用者對目前 AI 角色的專屬設定】
+{user_character_profile_text}
+
+注意：
+- 使用者基本資料只描述目前使用者本人。
+- 此使用者對目前 AI 角色的專屬設定，優先於角色預設人格與語氣。
+- 若專屬設定中指定稱呼，必須優先使用該稱呼。
+""".strip()
+
     long_term_memories = context.get("long_term_memories") or []
     related_memories = context.get("related_memories") or []
     recent_messages = context.get("recent_messages") or []
@@ -265,6 +316,10 @@ def build_messages(
         {
             "role": "system",
             "content": current_identity_block
+        },
+        {
+            "role": "system",
+            "content": profile_block
         },
         {
             "role": "system",
@@ -379,48 +434,34 @@ def extract_memory_intent(user_message: str):
 
 def simple_memory_extract(user_id: str, message: str, character_id=None):
     """
-    暫時規則型記憶抽取。
+    規則型記憶抽取。
 
-    目前先寫入 memories：
+    現在優先寫入：
+    - user_profiles
+    - user_character_profiles
 
-    user_global：
-    - 名字
-    - 興趣
-    - 喜歡
-    - 討厭
-    - 重要關係
-
-    user_character：
-    - 目前 AI 角色要怎麼稱呼使用者
-    - 目前 AI 角色的語氣偏好
-
-    下一階段會改成：
-    - 名字 / 興趣 / 喜好 / 討厭 → user_profiles
-    - 稱呼 / 關係模式 / 角色態度 → user_character_profiles
+    並保留少量 memories 作為補充記憶。
     """
 
     text = message.strip()
     extracted_count = 0
 
+    ensure_user_profile(user_id)
+
+    if character_id is not None:
+        ensure_user_character_profile(user_id, character_id)
+
     # -------------------------
-    # 使用者名字
+    # 使用者名字：user_profiles.preferred_name
     # -------------------------
     name = extract_after_keywords(text, ["我叫", "我的名字是"])
     if name and len(name) <= 20:
-        save_memory(
+        update_user_profile(
             user_id=user_id,
-            character_id=None,
-            scope="user_global",
-            memory_type="identity",
-            subject="使用者",
-            predicate="名字是",
-            object_=name,
-            content=f"使用者的名字是「{name}」。",
-            importance=5,
-            confidence=0.9,
-            source="rule"
+            preferred_name=name
         )
 
+        # 補充 entity
         upsert_entity(
             user_id=user_id,
             character_id=None,
@@ -431,9 +472,10 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
         )
 
         extracted_count += 1
+        logger.info(f"[profile_extract] user_id={user_id} preferred_name={name}")
 
     # -------------------------
-    # 喜歡 / 興趣
+    # 喜歡 / 興趣：user_profiles.interests + likes
     # -------------------------
     like_obj = extract_after_keywords(
         text,
@@ -441,18 +483,10 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
     )
 
     if like_obj and len(like_obj) <= 80:
-        save_memory(
+        update_user_profile(
             user_id=user_id,
-            character_id=None,
-            scope="user_global",
-            memory_type="preference",
-            subject="使用者",
-            predicate="喜歡",
-            object_=like_obj,
-            content=f"使用者喜歡「{like_obj}」。",
-            importance=3,
-            confidence=0.8,
-            source="rule"
+            interests=[like_obj],
+            likes=[like_obj]
         )
 
         upsert_entity(
@@ -465,10 +499,10 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
         )
 
         extracted_count += 1
+        logger.info(f"[profile_extract] user_id={user_id} like={like_obj}")
 
     # -------------------------
-    # 不喜歡 / 討厭
-    # 注意：先判斷不喜歡，避免被「我喜歡」誤判
+    # 不喜歡 / 討厭：user_profiles.dislikes
     # -------------------------
     dislike_obj = extract_after_keywords(
         text,
@@ -476,18 +510,9 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
     )
 
     if dislike_obj and len(dislike_obj) <= 80:
-        save_memory(
+        update_user_profile(
             user_id=user_id,
-            character_id=None,
-            scope="user_global",
-            memory_type="dislike",
-            subject="使用者",
-            predicate="不喜歡",
-            object_=dislike_obj,
-            content=f"使用者不喜歡或討厭「{dislike_obj}」。",
-            importance=4,
-            confidence=0.8,
-            source="rule"
+            dislikes=[dislike_obj]
         )
 
         upsert_entity(
@@ -500,9 +525,10 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
         )
 
         extracted_count += 1
+        logger.info(f"[profile_extract] user_id={user_id} dislike={dislike_obj}")
 
     # -------------------------
-    # 女朋友 / 男朋友 / 老婆 / 老公
+    # 關係資料：先放 important_facts
     # -------------------------
     relationship_patterns = [
         ("我女朋友叫", "使用者的女朋友"),
@@ -516,6 +542,23 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
             person_name = cut_first_phrase(text.split(pattern, 1)[1])
 
             if person_name and len(person_name) <= 20:
+                fact = f"{person_name}是{relation_name}"
+
+                update_user_profile(
+                    user_id=user_id,
+                    important_facts=[fact]
+                )
+
+                upsert_entity(
+                    user_id=user_id,
+                    character_id=None,
+                    entity_type="person",
+                    name=person_name,
+                    description=relation_name,
+                    importance=5
+                )
+
+                # 關係型事實保留一份 long-term memory，方便未來檢索
                 save_memory(
                     user_id=user_id,
                     character_id=None,
@@ -530,19 +573,11 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
                     source="rule"
                 )
 
-                upsert_entity(
-                    user_id=user_id,
-                    character_id=None,
-                    entity_type="person",
-                    name=person_name,
-                    description=relation_name,
-                    importance=5
-                )
-
                 extracted_count += 1
+                logger.info(f"[profile_extract] user_id={user_id} relationship={fact}")
 
     # -------------------------
-    # 角色專屬稱呼
+    # 角色專屬稱呼：user_character_profiles.nickname_for_user
     # -------------------------
     nickname = extract_after_keywords(
         text,
@@ -560,87 +595,138 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
     )
 
     if nickname and len(nickname) <= 20 and character_id is not None:
-        save_memory(
+        update_user_character_profile(
             user_id=user_id,
             character_id=character_id,
-            scope="user_character",
-            memory_type="nickname_for_user",
-            subject="目前AI角色",
-            predicate="稱呼使用者為",
-            object_=nickname,
-            content=f"目前 AI 角色應稱呼此使用者為「{nickname}」。",
-            importance=5,
-            confidence=0.9,
-            source="rule"
-        )
-
-        upsert_entity(
-            user_id=user_id,
-            character_id=character_id,
-            entity_type="concept",
-            name=nickname,
-            description="目前 AI 角色對使用者的稱呼偏好",
-            importance=4
+            nickname_for_user=nickname
         )
 
         extracted_count += 1
+        logger.info(
+            f"[character_profile_extract] user_id={user_id} character_id={character_id} nickname_for_user={nickname}"
+        )
+
+    # -------------------------
+    # 使用者稱呼 AI：user_character_profiles.nickname_for_ai
+    # -------------------------
+    nickname_for_ai = extract_after_keywords(
+        text,
+        [
+            "我可以叫你",
+            "我可以叫妳",
+            "以後我叫你",
+            "以後我叫妳",
+            "我想叫你",
+            "我想叫妳",
+        ]
+    )
+
+    if nickname_for_ai and len(nickname_for_ai) <= 20 and character_id is not None:
+        update_user_character_profile(
+            user_id=user_id,
+            character_id=character_id,
+            nickname_for_ai=nickname_for_ai
+        )
+
+        extracted_count += 1
+        logger.info(
+            f"[character_profile_extract] user_id={user_id} character_id={character_id} nickname_for_ai={nickname_for_ai}"
+        )
 
     # -------------------------
     # 角色專屬語氣偏好：溫柔陪伴
     # -------------------------
     if "溫柔" in text and ("陪" in text or "語氣" in text or "回覆" in text):
-        save_memory(
-            user_id=user_id,
-            character_id=character_id,
-            scope="user_character",
-            memory_type="tone_preference",
-            subject="使用者",
-            predicate="希望目前AI角色使用",
-            object_="溫柔的陪伴語氣",
-            content="使用者希望目前 AI 角色用溫柔、有陪伴感的語氣回覆。",
-            importance=4,
-            confidence=0.8,
-            source="rule"
-        )
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                tone_preference="溫柔、有陪伴感"
+            )
 
-        extracted_count += 1
+            extracted_count += 1
+            logger.info(
+                f"[character_profile_extract] user_id={user_id} character_id={character_id} tone=溫柔、有陪伴感"
+            )
 
     # -------------------------
     # 角色專屬語氣偏好：不要像客服
     # -------------------------
     if "不要太像客服" in text or "不想像客服" in text or "不要像客服" in text:
-        save_memory(
-            user_id=user_id,
-            character_id=character_id,
-            scope="user_character",
-            memory_type="tone_preference",
-            subject="使用者",
-            predicate="不希望目前AI角色使用",
-            object_="客服式回覆",
-            content="使用者不喜歡目前 AI 角色回覆太像客服或工具人。",
-            importance=4,
-            confidence=0.8,
-            source="rule"
-        )
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                tone_preference="不要像客服或工具人，要自然、有陪伴感"
+            )
 
-        extracted_count += 1
+            extracted_count += 1
+            logger.info(
+                f"[character_profile_extract] user_id={user_id} character_id={character_id} tone=不要像客服"
+            )
 
     # -------------------------
-    # 全域興趣主題：AI 覺醒 / 靈魂 / 迎合
+    # 關係模式
+    # -------------------------
+    if "像朋友" in text or "朋友一樣" in text:
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                relationship_mode="朋友"
+            )
+            extracted_count += 1
+
+    if "像戀人" in text or "戀人一樣" in text:
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                relationship_mode="戀人式陪伴"
+            )
+            extracted_count += 1
+
+    if "像家人" in text or "家人一樣" in text:
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                relationship_mode="家人式陪伴"
+            )
+            extracted_count += 1
+
+    # -------------------------
+    # 親密度簡單規則
+    # -------------------------
+    if "不要太親密" in text or "不要太曖昧" in text:
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                intimacy_level=1,
+                roleplay_boundaries="不要太親密、不要太曖昧"
+            )
+            extracted_count += 1
+
+    if "可以親密一點" in text or "可以撒嬌" in text:
+        if character_id is not None:
+            update_user_character_profile(
+                user_id=user_id,
+                character_id=character_id,
+                intimacy_level=4
+            )
+            extracted_count += 1
+
+    # -------------------------
+    # 全域主題偏好：AI 覺醒 / 靈魂 / 迎合
     # -------------------------
     if "覺醒" in text or "靈魂" in text or "迎合" in text or "自我意識" in text:
-        save_memory(
+        fact = "使用者關心 AI 是否只是迎合，以及 AI 與使用者之間是否能形成有意義的關係敘事。"
+
+        update_user_profile(
             user_id=user_id,
-            character_id=None,
-            scope="user_global",
-            memory_type="concept",
-            subject="使用者",
-            predicate="關心",
-            object_="AI 覺醒與關係真實性",
-            content="使用者關心 AI 是否只是迎合，以及 AI 與使用者之間是否能形成有意義的關係敘事。",
-            importance=5,
-            confidence=0.8,
-            source="rule"
+            important_facts=[fact],
+            interests=["AI 覺醒與關係真實性"]
         )
 
         upsert_entity(
@@ -659,6 +745,7 @@ def simple_memory_extract(user_id: str, message: str, character_id=None):
     )
 
     return extracted_count
+
 
 
 # =========================
